@@ -1,4 +1,5 @@
-// FileSync streaming-download Service Worker.
+// FileSync streaming-download Service Worker. It also serves streaming previews at
+// /__preview/{id} — see the section further down.
 //
 // The page registers a transfer by posting `{ type: 'register', id, name, size, mime, port }`
 // where `port` is one end of a MessageChannel. The page then navigates (or anchor-clicks)
@@ -24,6 +25,13 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 
 self.addEventListener('message', (event) => {
   const msg = event.data;
+  // The page checks the active worker knows the preview route before relying on it
+  // (a worker cached from an older release doesn't). Its periodic 'keepalive' messages
+  // need no handling: receiving any message keeps the worker running.
+  if (msg && msg.type === 'preview-ping' && event.ports[0]) {
+    event.ports[0].postMessage({ type: 'preview-pong' });
+    return;
+  }
   if (!msg || msg.type !== 'register') return;
 
   const { id, name, size, mime, port } = msg;
@@ -67,6 +75,12 @@ self.addEventListener('message', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
+  const preview = url.origin === self.location.origin && url.pathname.match(PREVIEW_RE);
+  if (preview) {
+    event.respondWith(servePreview(event.request, preview[1]));
+    return;
+  }
+
   const match = url.pathname.match(/^\/__download\/([A-Za-z0-9._-]+)$/);
   if (!match) return;
 
@@ -90,6 +104,139 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(new Response(entry.stream, { headers }));
 });
+
+// ---- Streaming previews ---------------------------------------------------------------
+//
+// `/__preview/{id}` serves a file another peer is sharing, read on demand over a WebRTC
+// preview session that the page holds (js/modules/viewer.js). The worker keeps no state:
+// per request it asks the window clients which one owns `id`, each over its own
+// MessagePort, then streams the requested range from that page one chunk per pull, as
+// fast as the browser consumes the body. Honoring Range is what lets <video> start at
+// once and seek.
+//
+// Port messages, worker -> page: {type:'open', start, end}, {type:'pull'}, {type:'cancel'}
+//                page -> worker: {ok, size, mime, name} (lookup reply), then
+//                                {type:'chunk', buf} | {type:'done'} | {type:'error', reason}
+
+// /__preview/{id}, optionally followed by /{file name} for the browser's viewer UI.
+const PREVIEW_RE = /^\/__preview\/([A-Za-z0-9_-]{1,64})(?:\/[^/]*)?$/;
+const PREVIEW_LOOKUP_TIMEOUT_MS = 3000;
+
+async function servePreview(request, id) {
+  if (request.method !== 'GET') return new Response(null, { status: 405 });
+  const owner = await findPreviewOwner(id);
+  if (!owner) return new Response('Preview not found or expired.', { status: 404 });
+  const { port, size, mime, name } = owner;
+
+  const range = parseRange(request.headers.get('range'), size);
+  if (range === null) {
+    port.close();
+    return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+  }
+  const { start, end } = range || { start: 0, end: size };  // end is exclusive
+  const headers = new Headers({
+    'Content-Type': mime,
+    'Content-Length': String(end - start),
+    'Accept-Ranges': 'bytes',
+    'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(name)}`,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'SAMEORIGIN',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+  });
+  if (range) headers.set('Content-Range', `bytes ${start}-${end - 1}/${size}`);
+  const status = range ? 206 : 200;
+  if (start === end) {
+    port.close();
+    return new Response(null, { status, headers });
+  }
+
+  let pending = null;   // the pull waiting for the page's next message
+  let failure = null;
+  port.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'error') failure = new Error(msg.reason || 'preview failed');
+    const p = pending;
+    pending = null;
+    if (!p) return;
+    if (msg.type === 'chunk' && msg.buf instanceof ArrayBuffer) {
+      p.controller.enqueue(new Uint8Array(msg.buf));
+    } else if (msg.type === 'done') {
+      p.controller.close();
+      port.close();
+    } else {
+      p.controller.error(failure || new Error('preview failed'));
+      port.close();
+    }
+    p.resolve();
+  };
+  port.postMessage({ type: 'open', start, end });
+
+  const body = new ReadableStream({
+    pull(controller) {
+      if (failure) { controller.error(failure); return; }
+      return new Promise((resolve) => {
+        pending = { controller, resolve };
+        port.postMessage({ type: 'pull' });
+      });
+    },
+    cancel() {
+      // The element moved on (seek, close): stop the reads behind this response.
+      port.postMessage({ type: 'cancel' });
+      port.close();
+    },
+  }, { highWaterMark: 4 });
+  return new Response(body, { status, headers });
+}
+
+// Find the window that holds preview `id`. Every window is asked: a request can come from
+// a frame (e.g. the PDF viewer) that isn't the owning page.
+async function findPreviewOwner(id) {
+  const clients = await self.clients.matchAll({ type: 'window' });
+  const ports = [];
+  const owner = await new Promise((resolve) => {
+    let waiting = clients.length;
+    if (!waiting) { resolve(null); return; }
+    const timer = setTimeout(() => resolve(null), PREVIEW_LOOKUP_TIMEOUT_MS);
+    for (const client of clients) {
+      const channel = new MessageChannel();
+      ports.push(channel.port1);
+      channel.port1.onmessage = (ev) => {
+        const reply = ev.data || {};
+        if (reply.ok && Number.isSafeInteger(reply.size) && reply.size >= 0 && typeof reply.mime === 'string') {
+          clearTimeout(timer);
+          resolve({ port: channel.port1, size: reply.size, mime: reply.mime, name: String(reply.name || 'file') });
+        } else if (--waiting === 0) {
+          clearTimeout(timer);
+          resolve(null);
+        }
+      };
+      client.postMessage({ type: 'preview-lookup', id }, [channel.port2]);
+    }
+  });
+  for (const port of ports) {
+    if (!owner || port !== owner.port) port.close();
+  }
+  return owner;
+}
+
+// Single-range `Range: bytes=…` as { start, end } (end exclusive). undefined means serve
+// the whole file (no header, or one we don't handle, like multiple ranges); null means
+// the range can't be satisfied (416).
+function parseRange(header, size) {
+  if (!header) return undefined;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m || (m[1] === '' && m[2] === '')) return undefined;
+  if (m[1] === '') {
+    // Suffix range: the last N bytes.
+    const n = Number(m[2]);
+    return n > 0 && size > 0 ? { start: Math.max(0, size - n), end: size } : null;
+  }
+  const start = Number(m[1]);
+  if (m[2] !== '' && Number(m[2]) < start) return undefined;
+  const end = m[2] === '' ? size : Math.min(Number(m[2]) + 1, size);
+  return start < size ? { start, end } : null;
+}
 
 // Garbage-collect transfers that were never fetched, or whose download has long finished.
 setInterval(() => {

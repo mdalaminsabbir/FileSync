@@ -340,6 +340,52 @@
           </div>
         </div>
 
+        <!-- PREVIEW MODAL -->
+        <div id="preview-modal" class="modal fade" tabindex="-1" style="text-align: left;">
+          <div class="modal-dialog modal-dialog-centered modal-xl">
+            <div class="modal-content">
+              <div class="modal-header">
+                <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" fill="#FC912D" class="bi bi-eye-fill" viewBox="0 0 16 16" style="flex-shrink:0; margin-right:10px">
+                  <path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"/>
+                  <path d="M0 8s3-5.5 8-5.5S16 8 16 8s-3 5.5-8 5.5S0 8 0 8m8 3.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7"/>
+                </svg>
+                <div class="preview-heading">
+                  <h5 id="preview-modal-name" style="color: var(--color-h1); margin:0"></h5>
+                  <div id="preview-modal-meta"></div>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+              </div>
+              <div class="modal-body">
+                <div id="preview-modal-status" class="preview-status">
+                  <div class="spinner-border" style="color: #0d6efd; width: 1.1rem; height: 1.1rem; --bs-spinner-border-width: 0.1em; margin-right:8px"></div>
+                  <span id="preview-modal-status-text"></span>
+                </div>
+                <div id="preview-modal-error" class="preview-status preview-error" style="display: none;">
+                  <p>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-exclamation-circle-fill" viewBox="0 0 16 16" style="margin-right: 6px; margin-bottom:3px">
+                      <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0M8 4a.905.905 0 0 0-.9.995l.35 3.507a.552.552 0 0 0 1.1 0l.35-3.507A.905.905 0 0 0 8 4m.002 6a1 1 0 1 0 0 2 1 1 0 0 0 0-2"/>
+                    </svg>
+                    <span id="preview-modal-error-text"></span>
+                  </p>
+                  <button id="preview-modal-retry" type="button" class="btn btn-secondary btn-sm">Try again</button>
+                </div>
+                <div id="preview-modal-stage" class="preview-stage"></div>
+                <div id="preview-modal-note" class="preview-note" style="display: none;"></div>
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button id="preview-modal-download" type="button" class="btn btn-primary">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16" style="margin-right:6px; margin-bottom:2px">
+                    <path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5"/>
+                    <path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708z"/>
+                  </svg>
+                  Download
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- DOWNLOAD ALL MODAL -->
         <div id="download-modal" class="modal fade" tabindex="-1" style="text-align: left;">
           <div class="modal-dialog modal-dialog-centered">

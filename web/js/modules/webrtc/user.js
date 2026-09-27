@@ -3,7 +3,9 @@ import { turn } from './turn.js';
 import { applyIceMode } from './mode.js';
 import { File } from './file.js';
 import { Peer } from './peer.js';
+import { PreviewServer, RemoteSource, PREVIEW_REASONS } from './preview.js';
 import { openSink } from '../sink.js';
+import { previewFormat, openPreview, previewFileGone } from '../viewer.js';
 import { downloadZip } from '../../vendors/client-zip.min.js';
 
 // Hard limits on user-controlled string fields received from the network. The display
@@ -34,6 +36,12 @@ const _sanitizeFilename = (s) => {
 // bandwidth while leaving comfortable headroom; excess requests are queued and the
 // receivers are told they're waiting.
 const _OUTBOUND_CONCURRENCY_CAP = 5;
+
+// Cap on simultaneous preview sessions a single owner serves. Each holds its own
+// RTCPeerConnection for as long as the viewer keeps the preview open (a paused video
+// costs nothing but the connection), so they get their own budget instead of eating
+// into download slots. Past the cap, viewers are told the owner is busy.
+const _PREVIEW_CONCURRENCY_CAP = 8;
 
 // Room-connection liveness. Same policy as the per-file watchdog in file.js: browsers
 // keep retrying a 'disconnected' ICE session for ~30s, so don't declare the room dead
@@ -67,6 +75,9 @@ export class User {
   // Outbound-transfer fan-out control. See _OUTBOUND_CONCURRENCY_CAP.
   _outboundActive = 0;
   _outboundQueue = [];  // each entry is the original `data` from webrtc-file-download
+  // Previews: sessions this user serves as an owner, and the one it is viewing.
+  _previewServers = new Set();
+  _previewSource = null;
 
   constructor(room_id) {
     this._room_id = room_id;
@@ -403,12 +414,17 @@ export class User {
     // Stop any in-flight outbound transfers immediately (the send loop checks both the
     // file-level _aborted and the per-receiver aborted flag).
     for (const p of Object.values(this._files[fileId]._remotePeers)) p.aborted = true
+    // End its preview sessions too — idle ones would otherwise only notice on the next read.
+    for (const server of this._previewServers) {
+      if (server.fileId === fileId) server.fail('removed')
+    }
 
     // Notify all peers
     for (let peer of Object.values(this._remotePeers)) {
       if ('conn' in peer) peer.conn.send({'webrtc-file-remove': {"peer_id": this._peer.id, "file_id": fileId}})
     }
     // Update UI
+    this._hidePreviewButton(fileId)
     document.getElementById(`file-${fileId}-remove`).style.display = 'none'
     document.getElementById(`file-${fileId}-icon-loading`).style.display = 'none'
     document.getElementById(`file-${fileId}-icon-success`).style.display = 'none'
@@ -702,6 +718,46 @@ export class User {
     document.getElementById(`file-${fileId}-icon-failed`).style.display = 'none'
     document.getElementById(`file-${fileId}-error`).style.display = 'block'
     document.getElementById(`file-${fileId}-error`).innerHTML = 'You have stopped the file transfer.'
+  }
+
+  // Preview a file: your own straight from disk, anyone else's streamed from its owner.
+  previewFile(fileId) {
+    const file = this._files[fileId];
+    if (!file || file.removed) return;
+    const format = previewFormat(file.name);
+    if (!format) return;
+    const isMine = file.owner_id == this._peer.id;
+    openPreview({
+      file: { id: file.id, name: file.name, size: file.size, owner: isMine ? 'you' : file.owner_name },
+      format,
+      local: isMine ? file._content : null,
+      connect: isMine ? null : () => this._connectPreview(file),
+      onDownload: isMine ? null : () => this.downloadFile(file.id),
+    });
+  }
+
+  // Start a preview session for a remote file. The source is returned right away so
+  // the viewer can tear it down mid-connect; `opened` settles once the owner serves.
+  _connectPreview(file) {
+    const source = new RemoteSource(file.size);
+    this._previewSource = source;
+    const opened = source.open((peerId) => this._sendPreviewRequest(file, peerId));
+    return { source, opened };
+  }
+
+  // Same routing as a download request: the host asks the owner, a guest asks the host.
+  _sendPreviewRequest(file, peerId) {
+    const target = this._remotePeers[this._isHost ? file.owner_id : this._room_id];
+    if (!target || !target.conn) return false;
+    target.conn.send({
+      'webrtc-file-preview': { file_id: file.id, requester_id: this._peer.id, peer_id: peerId },
+    });
+    return true;
+  }
+
+  _hidePreviewButton(fileId) {
+    const el = document.getElementById(`file-${fileId}-preview`);
+    if (el) el.style.display = 'none';
   }
 
   // See file details
@@ -1209,6 +1265,7 @@ export class User {
           clearInterval(this._remotePeers[p].interval);
           delete this._remotePeers[p]
           this._removeUserUI(p)
+          this._closePreviewsFor(p)
         }
       }
 
@@ -1247,6 +1304,12 @@ export class User {
     else if ('webrtc-file-cancel' in data && conn.peer in this._remotePeers) {
       this._onFileCancel(data['webrtc-file-cancel'])
     }
+    else if ('webrtc-file-preview' in data && conn.peer in this._remotePeers) {
+      this._onFilePreview(data['webrtc-file-preview'])
+    }
+    else if ('webrtc-file-preview-cancel' in data && conn.peer in this._remotePeers) {
+      this._onFilePreviewCancel(data['webrtc-file-preview-cancel'])
+    }
     else {
       // Unknown message type — log and ignore. Tearing down the connection here would
       // break compatibility with peers running a newer protocol that adds message types.
@@ -1279,8 +1342,12 @@ export class User {
           document.getElementById(`file-${file.id}-error`).style.display = 'block' 
           document.getElementById(`file-${file.id}-error`).innerHTML = 'The user has disconnected.'
           file.removed = true
+          this._hidePreviewButton(file.id)
+          previewFileGone(file.id, 'unavailable')
         }
       }
+      // Previews I was serving to them have no viewer left.
+      this._closePreviewsFor(conn.peer)
 
       // Remove peer user
       clearInterval(this._remotePeers[conn.peer].interval);
@@ -1510,12 +1577,79 @@ export class User {
     }
   }
 
+  // Inbound preview request: the owner serves it, the host relays it to the owner.
+  _onFilePreview(data) {
+    if (!data || !_isValidId(data.file_id) || !_isValidId(data.peer_id) || !_isValidId(data.requester_id)) return;
+    const file = this._files[data.file_id];
+    if (!file || file.removed) {
+      this._notifyPreviewCancel(data, 'removed');
+      return;
+    }
+    if (file.owner_id == this._peer.id) {
+      this._startPreviewServer(file, data);
+      return;
+    }
+    const target = this._remotePeers[file.owner_id];
+    if (target && target.conn) target.conn.send({ 'webrtc-file-preview': data });
+    else this._notifyPreviewCancel(data, 'unavailable');
+  }
+
+  _startPreviewServer(file, data) {
+    if (this._previewServers.size >= _PREVIEW_CONCURRENCY_CAP) {
+      this._notifyPreviewCancel(data, 'busy');
+      return;
+    }
+    const server = new PreviewServer(file, data);
+    this._previewServers.add(server);
+    server.onClose = () => this._previewServers.delete(server);
+    server.start().catch((err) => {
+      console.warn('Preview could not start for', data.file_id, '-', err?.message || err);
+      server.close();  // Frees the slot (idempotent: start() already cleans up after itself).
+      this._notifyPreviewCancel(data, 'failed');
+    });
+  }
+
+  // Tell a viewer its preview can't be served. Routes like webrtc-file-cancel: the host
+  // sends straight to the requester, a guest owner goes through the host.
+  _notifyPreviewCancel(data, reason) {
+    const payload = { file_id: data.file_id, requester_id: data.requester_id, peer_id: data.peer_id, reason };
+    const target = this._remotePeers[this._isHost ? data.requester_id : this._room_id];
+    if (target && target.conn) target.conn.send({ 'webrtc-file-preview-cancel': payload });
+  }
+
+  _onFilePreviewCancel(data) {
+    if (!data || !_isValidId(data.file_id) || !_isValidId(data.requester_id) || !_isValidId(data.peer_id)) return;
+    if (data.requester_id == this._peer.id) {
+      // Only the session this cancel names — a late one must not kill a newer preview.
+      const source = this._previewSource;
+      if (source && source.peerId === data.peer_id) {
+        source.fail(PREVIEW_REASONS.has(data.reason) ? data.reason : 'failed');
+      }
+      return;
+    }
+    if (this._isHost) {
+      const target = this._remotePeers[data.requester_id];
+      if (target && target.conn) {
+        const { file_id, requester_id, peer_id, reason } = data;
+        target.conn.send({ 'webrtc-file-preview-cancel': { file_id, requester_id, peer_id, reason } });
+      }
+    }
+  }
+
+  _closePreviewsFor(requesterId) {
+    for (const server of this._previewServers) {
+      if (server.requesterId === requesterId) server.close();
+    }
+  }
+
   _onFileRemove(data) {
     if (!data || !_isValidId(data.file_id) || !_isValidId(data.peer_id)) return;
     const file = this._files[data.file_id];
     if (!file) return;
     // Abort the file transfer
     file.remove()
+    previewFileGone(data.file_id, 'removed')
+    this._hidePreviewButton(data.file_id)
 
     document.getElementById(`file-${data.file_id}-abort`).style.display = 'none'
     document.getElementById(`file-${data.file_id}-download`).style.display = 'none'
@@ -1584,6 +1718,7 @@ export class User {
     li.setAttribute('class', 'list-group-item')
 
     const isMine = file.owner_id == this._peer.id;
+    const canPreview = previewFormat(file.name) !== null;
     li.innerHTML = `
       <div class="row align-items-center">
         <div class="col-auto" style="padding-right: 0">
@@ -1614,6 +1749,15 @@ export class User {
           <div id="file-${file.id}-details" style="color: #0d6efd; font-size: .9rem; font-weight: 500; text-align: left; padding-top:5px; padding-bottom:4px; padding-right:4px; cursor:pointer; display: ${isMine ? 'block' : 'none'}">See details</div>
         </div>
 
+        <div id="file-${file.id}-preview" class="col-auto text-end" title="Preview file" style="cursor: pointer; display: ${canPreview ? 'block' : 'none'}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" fill="#FC912D" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" d="M1 8a7 7 0 1 0 14 0A7 7 0 0 0 1 8zm15 0A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
+            <g transform="translate(3.5 3.5) scale(0.5625)">
+              <path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0"/>
+              <path d="M0 8s3-5.5 8-5.5S16 8 16 8s-3 5.5-8 5.5S0 8 0 8m8 3.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7"/>
+            </g>
+          </svg>
+        </div>
         <div id="file-${file.id}-remove" class="col-auto text-end" title="Remove file" style="cursor: pointer; display: ${isMine ? 'block-inline' : 'none'}">
           <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" fill="#dc3545" class="bi bi-x-circle" viewBox="0 0 16 16">
             <path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/>
@@ -1641,6 +1785,7 @@ export class User {
     on(`file-${file.id}-remove`, () => this.removeFile(file.id));
     on(`file-${file.id}-abort`, () => this.abortFile(file.id));
     on(`file-${file.id}-download`, () => this.downloadFile(file.id));
+    on(`file-${file.id}-preview`, () => this.previewFile(file.id));
 
     // Insert user-controlled text safely (textContent never parses HTML).
     const nameEl = document.getElementById(`file-${file.id}-name`);

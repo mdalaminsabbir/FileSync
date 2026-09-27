@@ -442,6 +442,124 @@ textarea::-webkit-scrollbar-thumb {
   font-weight: 600;
 }
 
+/* --- Preview Modal --- */
+
+.preview-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+#preview-modal-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#preview-modal-meta {
+  font-size: 13px;
+  color: var(--color-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 240px;
+  color: var(--color-p);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.preview-error {
+  flex-direction: column;
+  text-align: center;
+}
+
+.preview-error p {
+  color: #dc3545;
+  margin-bottom: 14px;
+}
+
+.preview-stage:empty {
+  display: none;
+}
+
+.preview-stage {
+  display: flex;
+  justify-content: center;
+}
+
+.preview-stage.preview-loading {
+  height: 0;
+  overflow: hidden;
+}
+
+.preview-image,
+.preview-video {
+  display: block;
+  max-width: 100%;
+  max-height: 72vh;
+  border-radius: 8px;
+}
+
+.preview-image {
+  object-fit: contain;
+}
+
+.preview-video {
+  width: 100%;
+  background-color: #000;
+}
+
+.preview-audio-wrap {
+  width: 100%;
+  max-width: 560px;
+  padding: 28px 0 12px;
+  text-align: center;
+  color: #FC912D;
+}
+
+.preview-audio-wrap audio {
+  display: block;
+  width: 100%;
+  margin-top: 24px;
+}
+
+.preview-pdf {
+  display: block;
+  width: 100%;
+  height: 75vh;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background-color: #fff;
+}
+
+.preview-text {
+  width: 100%;
+  max-height: 72vh;
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-p);
+  background-color: var(--color-card-header-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.preview-note {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--color-muted);
+}
+
 /* --- Progress Bars --- */
 
 .progress {

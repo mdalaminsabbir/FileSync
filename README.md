@@ -19,6 +19,7 @@
 - **Private**: files go directly between browsers over encrypted WebRTC; the server never sees them.
 - **Any file size**: files stream to disk as they arrive, so memory use stays flat no matter the size.
 - **Automatic resume**: interrupted transfers reconnect and continue from where they stopped.
+- **Preview before you download**: view images, PDFs and text, and play video and audio straight from the sender, with instant seeking.
 - **One-to-many**: share a room link or QR code and send to many devices at once.
 - **Works across networks**: direct connection when possible, automatic relay when not.
 - **No installs or accounts**: recipients just open a link; rooms can be password-protected.
@@ -90,6 +91,8 @@ On the receiving side, the first save method the browser supports is used, in th
 3. **Blob** — buffers the entire file in memory before saving. Last resort; the only option over plain HTTP.
 
 The first two require a secure context (HTTPS or localhost), so serving FileSync over HTTPS is recommended: it enables memory-safe transfers of any size.
+
+Previews read the file on demand instead of downloading it. The viewer opens its own peer-to-peer connection to the sender and asks for byte ranges as it needs them; the Service Worker turns the browser's range requests from `<video>`, `<audio>`, `<img>` and the PDF viewer into those reads, so playback starts immediately and seeking fetches only the part you jump to. Without a Service Worker (plain HTTP), previews of files up to 256 MB are loaded into memory first.
 
 ![File Transfer - https://xkcd.com/949](web/assets/comic.png)
 
